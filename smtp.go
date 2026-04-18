@@ -1,20 +1,37 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
+	"io"
+	"mime/multipart"
 	"net"
 	"net/smtp"
+	"net/textproto"
 	"strconv"
 	"strings"
 )
 
-func sendSMTPEmail(cfg smtpConfig, from string, to []string, subject, body string) error {
+const smtpImplicitTLS = 465
+
+func sendSMTPEmail(cfg smtpConfig, from string, to []string, subject, plainBody, htmlBody string) error {
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("dial smtp: %w", err)
+
+	var conn net.Conn
+	var err error
+	if cfg.Port == smtpImplicitTLS {
+		tlsCfg := &tls.Config{ServerName: serverNameForTLS(cfg.Host)}
+		conn, err = tls.Dial("tcp", addr, tlsCfg)
+		if err != nil {
+			return fmt.Errorf("tls dial smtp: %w", err)
+		}
+	} else {
+		conn, err = net.Dial("tcp", addr)
+		if err != nil {
+			return fmt.Errorf("dial smtp: %w", err)
+		}
 	}
 	defer conn.Close()
 
@@ -24,10 +41,12 @@ func sendSMTPEmail(cfg smtpConfig, from string, to []string, subject, body strin
 	}
 	defer func() { _ = client.Close() }()
 
-	if ok, _ := client.Extension("STARTTLS"); ok {
-		tlsCfg := &tls.Config{ServerName: cfg.Host}
-		if err := client.StartTLS(tlsCfg); err != nil {
-			return fmt.Errorf("starttls: %w", err)
+	if cfg.Port != smtpImplicitTLS {
+		if ok, _ := client.Extension("STARTTLS"); ok {
+			tlsCfg := &tls.Config{ServerName: serverNameForTLS(cfg.Host)}
+			if err := client.StartTLS(tlsCfg); err != nil {
+				return fmt.Errorf("starttls: %w", err)
+			}
 		}
 	}
 
@@ -51,7 +70,11 @@ func sendSMTPEmail(cfg smtpConfig, from string, to []string, subject, body strin
 	if err != nil {
 		return fmt.Errorf("data: %w", err)
 	}
-	msg := buildRFC822Message(from, to, subject, body)
+	msg, err := buildMultipartMessage(from, to, subject, plainBody, htmlBody)
+	if err != nil {
+		_ = wc.Close()
+		return err
+	}
 	if _, err := wc.Write(msg); err != nil {
 		_ = wc.Close()
 		return fmt.Errorf("write body: %w", err)
@@ -65,40 +88,78 @@ func sendSMTPEmail(cfg smtpConfig, from string, to []string, subject, body strin
 	return nil
 }
 
-func buildRFC822Message(from string, to []string, subject, body string) []byte {
-	subjEnc := mimeEncodeHeader(subject)
-	bodyB64 := base64.StdEncoding.EncodeToString([]byte(body))
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("From: %s\r\n", from))
-	b.WriteString(fmt.Sprintf("To: %s\r\n", strings.Join(to, ", ")))
-	b.WriteString(fmt.Sprintf("Subject: %s\r\n", subjEnc))
-	b.WriteString("MIME-Version: 1.0\r\n")
-	b.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
-	b.WriteString("Content-Transfer-Encoding: base64\r\n")
-	b.WriteString("\r\n")
-	// Wrap base64 at 76 columns for RFC 2045.
-	const lineLen = 76
-	for i := 0; i < len(bodyB64); i += lineLen {
-		end := i + lineLen
-		if end > len(bodyB64) {
-			end = len(bodyB64)
-		}
-		b.WriteString(bodyB64[i:end])
-		b.WriteString("\r\n")
+func serverNameForTLS(host string) string {
+	h, _, err := net.SplitHostPort(host)
+	if err != nil {
+		return host
 	}
-	return []byte(b.String())
+	return h
 }
 
-func mimeEncodeHeader(s string) string {
-	ascii := true
-	for i := 0; i < len(s); i++ {
-		if s[i] < 0x20 || s[i] >= 0x7f {
-			ascii = false
-			break
+func buildMultipartMessage(from string, to []string, subject, plainBody, htmlBody string) ([]byte, error) {
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+
+	writePart := func(h textproto.MIMEHeader, content string) error {
+		pw, err := mw.CreatePart(h)
+		if err != nil {
+			return err
+		}
+		return writeBase64Lines(pw, content)
+	}
+
+	ph := make(textproto.MIMEHeader)
+	ph.Set("Content-Type", "text/plain; charset=UTF-8")
+	ph.Set("Content-Transfer-Encoding", "base64")
+	if err := writePart(ph, plainBody); err != nil {
+		return nil, err
+	}
+
+	hh := make(textproto.MIMEHeader)
+	hh.Set("Content-Type", "text/html; charset=UTF-8")
+	hh.Set("Content-Transfer-Encoding", "base64")
+	if err := writePart(hh, htmlBody); err != nil {
+		return nil, err
+	}
+	if err := mw.Close(); err != nil {
+		return nil, err
+	}
+
+	subjEnc := encodeSubjectHeader(subject)
+	var out strings.Builder
+	out.WriteString(fmt.Sprintf("From: %s\r\n", from))
+	out.WriteString(fmt.Sprintf("To: %s\r\n", strings.Join(to, ", ")))
+	out.WriteString(fmt.Sprintf("Subject: %s\r\n", subjEnc))
+	out.WriteString("MIME-Version: 1.0\r\n")
+	fmt.Fprintf(&out, "Content-Type: multipart/alternative; boundary=%s\r\n", mw.Boundary())
+	out.WriteString("\r\n")
+	out.Write(body.Bytes())
+	return []byte(out.String()), nil
+}
+
+func writeBase64Lines(w io.Writer, s string) error {
+	enc := base64.StdEncoding.EncodeToString([]byte(s))
+	const lineLen = 76
+	for i := 0; i < len(enc); i += lineLen {
+		end := i + lineLen
+		if end > len(enc) {
+			end = len(enc)
+		}
+		if _, err := io.WriteString(w, enc[i:end]); err != nil {
+			return err
+		}
+		if _, err := w.Write([]byte("\r\n")); err != nil {
+			return err
 		}
 	}
-	if ascii {
-		return s
+	return nil
+}
+
+func encodeSubjectHeader(s string) string {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] >= 0x7f {
+			return fmt.Sprintf("=?UTF-8?B?%s?=", base64.StdEncoding.EncodeToString([]byte(s)))
+		}
 	}
-	return fmt.Sprintf("=?UTF-8?B?%s?=", base64.StdEncoding.EncodeToString([]byte(s)))
+	return s
 }

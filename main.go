@@ -77,7 +77,7 @@ func loadConfig() (*config, error) {
 	if host == "" {
 		return nil, fmt.Errorf("SMTP_HOST is required")
 	}
-	port := 587
+	port := 465
 	if p := strings.TrimSpace(os.Getenv("SMTP_PORT")); p != "" {
 		var pp int
 		if _, err := fmt.Sscanf(p, "%d", &pp); err != nil || pp <= 0 {
@@ -198,7 +198,6 @@ func handleXquikWebhook(w http.ResponseWriter, r *http.Request, cfg *config, ded
 		return
 	}
 
-	subject := fmt.Sprintf("[Xquik] %s — @%s", ev.EventType, ev.Username)
 	var prettyData string
 	if len(ev.Data) > 0 {
 		var buf bytes.Buffer
@@ -207,16 +206,19 @@ func handleXquikWebhook(w http.ResponseWriter, r *http.Request, cfg *config, ded
 		} else {
 			prettyData = buf.String()
 		}
+	} else {
+		prettyData = "{}"
 	}
-	msgBody := fmt.Sprintf(
-		"事件类型: %s\n监控用户: @%s\n时间: %s\n\n原始 data:\n%s\n",
-		ev.EventType,
-		ev.Username,
-		time.Now().UTC().Format(time.RFC3339),
-		prettyData,
-	)
 
-	if err := sendSMTPEmail(cfg.SMTP, cfg.MailFrom, cfg.MailTo, subject, msgBody); err != nil {
+	now := time.Now()
+	subject, plain, html, err := renderWebhookMail(ev, prettyData, now)
+	if err != nil {
+		log.Printf("render mail: %v", err)
+		http.Error(w, "mail render failed", http.StatusInternalServerError)
+		return
+	}
+
+	if err := sendSMTPEmail(cfg.SMTP, cfg.MailFrom, cfg.MailTo, subject, plain, html); err != nil {
 		log.Printf("smtp send failed: %v", err)
 		http.Error(w, "mail delivery failed", http.StatusInternalServerError)
 		return
