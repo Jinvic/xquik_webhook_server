@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 	"net"
 	"net/smtp"
@@ -18,6 +19,7 @@ const smtpImplicitTLS = 465
 
 func sendSMTPEmail(cfg smtpConfig, from string, to []string, subject, plainBody, htmlBody string) error {
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
+	log.Printf("smtp: dial addr=%s implicit_tls=%v", addr, cfg.Port == smtpImplicitTLS)
 
 	var conn net.Conn
 	var err error

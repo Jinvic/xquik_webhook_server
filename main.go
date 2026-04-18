@@ -31,13 +31,19 @@ func main() {
 		log.Fatal(err)
 	}
 
-	dedup := newDeduper(4096)
+	dedupCap := 4096
+	dedup := newDeduper(dedupCap)
+	logStartup(cfg, dedupCap)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
+			log.Printf("health: method not allowed method=%s path=%s %s", r.Method, r.URL.Path, requestClientDesc(r))
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
+		}
+		if logHealthEnabled() {
+			log.Printf("health: ok %s", requestClientDesc(r))
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
@@ -127,6 +133,39 @@ func loadConfig() (*config, error) {
 	}, nil
 }
 
+func logStartup(cfg *config, dedupCap int) {
+	tlsMode := "implicit_tls"
+	if cfg.SMTP.Port != 465 {
+		tlsMode = "starttls_if_supported"
+	}
+	log.Printf(
+		"startup: http_addr=%s webhook_secret_configured=yes smtp_host=%s smtp_port=%d tls_mode=%s smtp_user=%s mail_from=%s recipients=%d dedup_cap=%d",
+		cfg.HTTPAddr,
+		cfg.SMTP.Host,
+		cfg.SMTP.Port,
+		tlsMode,
+		cfg.SMTP.User,
+		cfg.MailFrom,
+		len(cfg.MailTo),
+		dedupCap,
+	)
+}
+
+func logHealthEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("LOG_HEALTH")))
+	return v == "1" || v == "true" || v == "yes"
+}
+
+func requestClientDesc(r *http.Request) string {
+	ff := r.Header.Get("X-Forwarded-For")
+	ri := r.Header.Get("X-Real-IP")
+	ua := r.Header.Get("User-Agent")
+	if len(ua) > 200 {
+		ua = ua[:200] + "…"
+	}
+	return fmt.Sprintf("remote=%s x_forwarded_for=%q x_real_ip=%q ua=%q", r.RemoteAddr, ff, ri, ua)
+}
+
 func verifySignature(payload []byte, signatureHeader, secret string) bool {
 	if signatureHeader == "" || secret == "" {
 		return false
@@ -169,17 +208,25 @@ func (d *deduper) seenPayload(hash string) bool {
 
 func handleXquikWebhook(w http.ResponseWriter, r *http.Request, cfg *config, dedup *deduper) {
 	if r.Method != http.MethodPost {
+		log.Printf("webhook: method not allowed method=%s path=%s %s", r.Method, r.URL.Path, requestClientDesc(r))
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	t0 := time.Now()
+
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
+		log.Printf("webhook: read body: %v %s", err, requestClientDesc(r))
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 
+	log.Printf("webhook: incoming bytes=%d %s", len(body), requestClientDesc(r))
+
 	sig := r.Header.Get("X-Xquik-Signature")
 	if !verifySignature(body, sig, cfg.WebhookSecret) {
+		log.Printf("webhook: invalid signature sig_present=%v %s", sig != "", requestClientDesc(r))
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
 	}
@@ -187,6 +234,7 @@ func handleXquikWebhook(w http.ResponseWriter, r *http.Request, cfg *config, ded
 	sum := sha256.Sum256(body)
 	hash := hex.EncodeToString(sum[:])
 	if dedup.seenPayload(hash) {
+		log.Printf("webhook: duplicate payload_hash_prefix=%s %s", hash[:16], requestClientDesc(r))
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("duplicate"))
 		return
@@ -194,6 +242,7 @@ func handleXquikWebhook(w http.ResponseWriter, r *http.Request, cfg *config, ded
 
 	var ev webhookEvent
 	if err := json.Unmarshal(body, &ev); err != nil {
+		log.Printf("webhook: json unmarshal: %v body_bytes=%d %s", err, len(body), requestClientDesc(r))
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
@@ -213,16 +262,32 @@ func handleXquikWebhook(w http.ResponseWriter, r *http.Request, cfg *config, ded
 	now := time.Now()
 	subject, plain, html, err := renderWebhookMail(ev, prettyData, now)
 	if err != nil {
-		log.Printf("render mail: %v", err)
+		log.Printf("webhook: render mail failed eventType=%q username=%q: %v", ev.EventType, ev.Username, err)
 		http.Error(w, "mail render failed", http.StatusInternalServerError)
 		return
 	}
 
+	log.Printf(
+		"webhook: sending mail eventType=%q username=%q subject=%q smtp=%s:%d",
+		ev.EventType,
+		ev.Username,
+		subject,
+		cfg.SMTP.Host,
+		cfg.SMTP.Port,
+	)
+
 	if err := sendSMTPEmail(cfg.SMTP, cfg.MailFrom, cfg.MailTo, subject, plain, html); err != nil {
-		log.Printf("smtp send failed: %v", err)
+		log.Printf("webhook: smtp send failed eventType=%q username=%q: %v", ev.EventType, ev.Username, err)
 		http.Error(w, "mail delivery failed", http.StatusInternalServerError)
 		return
 	}
+
+	log.Printf(
+		"webhook: ok eventType=%q username=%q elapsed=%s",
+		ev.EventType,
+		ev.Username,
+		time.Since(t0).Truncate(time.Millisecond),
+	)
 
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))

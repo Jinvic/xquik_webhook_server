@@ -20,6 +20,7 @@
 | `MAIL_FROM` | 是 | 发件人地址 |
 | `MAIL_TO` | 是 | 收件人，多个用英文逗号分隔 |
 | `HTTP_ADDR` | 否 | 默认 `:8080` |
+| `LOG_HEALTH` | 否 | 设为 `1` / `true` / `yes` 时，每次访问 `/health` 打印一行访问日志（默认关闭，避免健康检查刷屏） |
 
 使用 Docker Compose 时，可在 `.env` 中设置 **`HTTP_PORT`**（默认 `8080`），用于映射宿主机端口，见 `docker-compose.yml`。
 
