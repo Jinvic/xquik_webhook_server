@@ -11,10 +11,15 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+const fiveMinutesMs = int64(5 * 60 * 1000)
+
+var seenNonces sync.Map
 
 // Xquik webhook payload (data shape varies by event type).
 // See https://docs.xquik.com/llms.txt — Webhook Delivery.
@@ -166,14 +171,43 @@ func requestClientDesc(r *http.Request) string {
 	return fmt.Sprintf("remote=%s x_forwarded_for=%q x_real_ip=%q ua=%q", r.RemoteAddr, ff, ri, ua)
 }
 
-func verifySignature(payload []byte, signatureHeader, secret string) bool {
-	if signatureHeader == "" || secret == "" {
+func verifyWebhook(payload []byte, headers http.Header, secret string) bool {
+	timestamp := headers.Get("X-Xquik-Timestamp")
+	nonce := headers.Get("X-Xquik-Nonce")
+	signature := headers.Get("X-Xquik-Signature")
+	if timestamp == "" || nonce == "" || signature == "" || secret == "" {
 		return false
 	}
+
+	ts, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil {
+		return false
+	}
+	nowMs := time.Now().UnixMilli()
+	diff := nowMs - ts
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff > fiveMinutesMs {
+		return false
+	}
+
+	seenNonces.Range(func(key, value any) bool {
+		expiresAt, ok := value.(int64)
+		if ok && expiresAt <= nowMs {
+			seenNonces.Delete(key)
+		}
+		return true
+	})
+	if _, replayed := seenNonces.LoadOrStore(nonce, nowMs+fiveMinutesMs); replayed {
+		return false
+	}
+
+	signingString := fmt.Sprintf("%s.%s.%s", timestamp, nonce, string(payload))
 	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write(payload)
+	mac.Write([]byte(signingString))
 	expected := "sha256=" + hex.EncodeToString(mac.Sum(nil))
-	return hmac.Equal([]byte(expected), []byte(signatureHeader))
+	return hmac.Equal([]byte(expected), []byte(signature))
 }
 
 type deduper struct {
@@ -224,9 +258,14 @@ func handleXquikWebhook(w http.ResponseWriter, r *http.Request, cfg *config, ded
 
 	log.Printf("webhook: incoming bytes=%d %s", len(body), requestClientDesc(r))
 
-	sig := r.Header.Get("X-Xquik-Signature")
-	if !verifySignature(body, sig, cfg.WebhookSecret) {
-		log.Printf("webhook: invalid signature sig_present=%v %s", sig != "", requestClientDesc(r))
+	if !verifyWebhook(body, r.Header, cfg.WebhookSecret) {
+		log.Printf(
+			"webhook: invalid signature ts_present=%v nonce_present=%v sig_present=%v %s",
+			r.Header.Get("X-Xquik-Timestamp") != "",
+			r.Header.Get("X-Xquik-Nonce") != "",
+			r.Header.Get("X-Xquik-Signature") != "",
+			requestClientDesc(r),
+		)
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
 	}
